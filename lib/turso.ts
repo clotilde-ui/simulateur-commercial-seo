@@ -1,11 +1,32 @@
-import { createClient } from '@libsql/client';
+import { createClient, type Client } from '@libsql/client';
 
-if (!process.env.TURSO_DATABASE_URL) throw new Error('TURSO_DATABASE_URL manquant');
-if (!process.env.TURSO_AUTH_TOKEN)   throw new Error('TURSO_AUTH_TOKEN manquant');
+// Le client est créé de manière paresseuse : la validation des variables
+// d'environnement n'a lieu qu'au premier accès (runtime), pas à l'import du
+// module. Cela évite que le build Vercel échoue lors de la collecte des routes
+// (« collect page data »), moment où les variables Turso ne sont pas fournies.
+let _client: Client | null = null;
 
-export const db = createClient({
-  url:       process.env.TURSO_DATABASE_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN,
+function getClient(): Client {
+  if (_client) return _client;
+
+  if (!process.env.TURSO_DATABASE_URL) throw new Error('TURSO_DATABASE_URL manquant');
+  if (!process.env.TURSO_AUTH_TOKEN)   throw new Error('TURSO_AUTH_TOKEN manquant');
+
+  _client = createClient({
+    url:       process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+  return _client;
+}
+
+// Proxy conservant l'API `db.execute(...)` tout en différant la création du
+// client jusqu'au premier accès à une de ses propriétés.
+export const db: Client = new Proxy({} as Client, {
+  get(_target, prop, receiver) {
+    const client = getClient();
+    const value = Reflect.get(client, prop, receiver);
+    return typeof value === 'function' ? value.bind(client) : value;
+  },
 });
 
 export async function initDb() {
