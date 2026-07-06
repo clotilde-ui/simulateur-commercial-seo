@@ -305,6 +305,11 @@ const SEASON_PRESETS = {
   estival:   [false, false, false, true, true, true, true, true, true, false, false, false],   // Avr-Sep
 };
 
+// Catégorie + mot-clé vierges pré-créés au lancement d'un nouveau projet, afin
+// que l'utilisateur puisse saisir directement (le "+" crée des lignes/catégories
+// supplémentaires).
+const INITIAL_CATEGORY_ID = 'cat1';
+
 const INITIAL: SimState = {
   prospectName: '',
   siteUrl: '',
@@ -312,7 +317,9 @@ const INITIAL: SimState = {
   da: 20,
   healthScore: 60,
   basketValue: 100,
-  keywords: [],
+  keywords: [
+    { id: 'kw1', keyword: '', volume: 1000, difficulty: 30, proximity: 1, intention: 1, topic: '', categoryId: INITIAL_CATEGORY_ID, zone: 'chalandise' },
+  ],
   crTransactionnel: 5,
   crPreAchat: 2.5,
   crIntermediaire: 1,
@@ -326,7 +333,9 @@ const INITIAL: SimState = {
   businessType: 'ecommerce',
   tauxRdv: 60,
   tauxClosing: 30,
-  categories: [],
+  categories: [
+    { id: INITIAL_CATEGORY_ID, name: 'Catégorie 1', budget: DEFAULT_CATEGORY_BUDGET },
+  ],
   budgetCatsHidden: false,
   chalandisePercent: 100,
   breakEvenMode: 'mensuel',
@@ -385,6 +394,138 @@ function decodeState(b64: string): SimState {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 function uid() { return Math.random().toString(36).slice(2, 10); }
+
+/* ─── MAPPING D'IMPORT DE MOTS CLÉS ───────────────────────────
+   Cœur de la conversion d'un export SEO quelconque (Semrush, Ahrefs,
+   Search Console, etc.) vers le format template attendu. Deux fonctions :
+     1. identifyColumns  — identifie les colonnes à partir de la ligne 1
+     2. buildTemplateAoA — met en forme les données au format template     */
+
+const normalizeHeader = (s: string) =>
+  s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+
+const INTENT_MAP: Record<string, Intention> = {
+  transactionnel: 1, transactional: 1, achat: 1, '1': 1,
+  'pré-achat': 2, 'pre-achat': 2, preachat: 2, consideration: 2, navigationnelle: 2, navigationnel: 2, '2': 2,
+  intermédiaire: 3, intermediaire: 3, commerciale: 3, commercial: 3, '3': 3,
+  informationnel: 4, informational: 4, information: 4, info: 4, '4': 4,
+};
+const PROXIMITY_MAP: Record<string, Proximity> = {
+  exact: 1, 'sujet exact': 1, 'mot cle exact': 1, '1': 1,
+  proche: 2, 'tres proche': 2, 'très proche': 2, near: 2, '2': 2,
+  thematique: 3, thématique: 3, thematic: 3, large: 3, '3': 3,
+};
+
+type KeywordField = 'categorie' | 'keyword' | 'volume' | 'difficulte' | 'proximite' | 'intention' | 'sujet';
+type ColumnMap = Partial<Record<KeywordField, string>>;
+
+// Champs canoniques du template et alias d'en-têtes reconnus pour chacun,
+// afin que les exports d'outils SEO soient identifiés quel que soit le libellé.
+const COLUMN_ALIASES: Record<KeywordField, string[]> = {
+  categorie:  ['categorie', 'catégorie', 'category', 'cat', 'groupe', 'cluster'],
+  keyword:    ['mot cle', 'mot-clé', 'mot-cle', 'mot clé', 'keyword', 'kw', 'requete', 'requête', 'query', 'terme'],
+  volume:     ['volume', 'vol', 'volume mensuel', 'volume de recherche', 'search volume', 'monthly volume', 'avg. monthly searches', 'recherches mensuelles'],
+  difficulte: ['difficulte', 'difficulté', 'difficulty', 'diff', 'kd', 'kd %', 'seo difficulty', 'keyword difficulty'],
+  proximite:  ['proximite', 'proximité', 'proximity', 'prox'],
+  intention:  ['intention', 'intent', 'search intent'],
+  sujet:      ['sujet', 'topic', 'theme', 'thème', 'page'],
+};
+
+const TEMPLATE_HEADERS = ['Catégorie', 'Mot clé', 'Volume', 'Difficulté', 'Proximité', 'Intention', 'Sujet'];
+
+const parseLocalizedNumber = (value: unknown, fallback = 0): number => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+  let raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+
+  raw = raw.toLowerCase();
+  const rangeParts = raw.split(/\s*[-–—]\s*/).filter(Boolean);
+  if (rangeParts.length === 2) {
+    const [minRange, maxRange] = rangeParts.map(part => parseLocalizedNumber(part, fallback));
+    return (minRange + maxRange) / 2;
+  }
+
+  raw = raw
+    .replace(/[  \s]/g, '')
+    .replace(/€/g, '')
+    .replace(/%/g, '');
+
+  let multiplier = 1;
+  if (raw.endsWith('k')) { multiplier = 1_000; raw = raw.slice(0, -1); }
+  if (raw.endsWith('m')) { multiplier = 1_000_000; raw = raw.slice(0, -1); }
+
+  const comma = raw.lastIndexOf(',');
+  const dot = raw.lastIndexOf('.');
+  if (comma !== -1 && dot !== -1) {
+    raw = comma > dot ? raw.replace(/\./g, '').replace(',', '.') : raw.replace(/,/g, '');
+  } else if (comma !== -1) {
+    const parts = raw.split(',');
+    raw = parts.length > 1 && parts.at(-1)?.length === 3 ? raw.replace(/,/g, '') : raw.replace(',', '.');
+  } else if (dot !== -1) {
+    const parts = raw.split('.');
+    raw = parts.length > 1 && parts.slice(1).every(part => part.length === 3) ? raw.replace(/\./g, '') : raw;
+  }
+
+  const parsed = Number(raw.replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(parsed) ? parsed * multiplier : fallback;
+};
+
+const parseProximity = (value: unknown): Proximity => {
+  const normalized = normalizeHeader(String(value ?? ''));
+  const numeric = Math.round(parseLocalizedNumber(value, 1));
+  return PROXIMITY_MAP[normalized] ?? (Math.min(3, Math.max(1, numeric)) as Proximity);
+};
+
+const parseIntention = (value: unknown): Intention =>
+  (INTENT_MAP[normalizeHeader(String(value ?? ''))] ?? 1) as Intention;
+
+/* FONCTION 1 — Identification/mapping des colonnes à partir de la ligne 1
+   (les en-têtes) du fichier importé. Renvoie, pour chaque champ canonique
+   du template, la clé d'en-tête source correspondante (absente si non trouvée). */
+function identifyColumns(headers: string[]): ColumnMap {
+  const normalizedToOriginal: Record<string, string> = {};
+  headers.forEach(h => { const n = normalizeHeader(String(h)); if (n && !(n in normalizedToOriginal)) normalizedToOriginal[n] = String(h); });
+
+  const map: ColumnMap = {};
+  (Object.keys(COLUMN_ALIASES) as KeywordField[]).forEach(field => {
+    const match = COLUMN_ALIASES[field]
+      .map(alias => normalizedToOriginal[normalizeHeader(alias)])
+      .find(key => key !== undefined);
+    if (match !== undefined) map[field] = match;
+  });
+  return map;
+}
+
+/* FONCTION 2 — Mise en forme des lignes au format template attendu
+   (Catégorie, Mot clé, Volume, Difficulté, Proximité, Intention, Sujet).
+   S'appuie sur le mapping renvoyé par identifyColumns. Les lignes sans
+   mot clé sont ignorées. Renvoie un tableau de tableaux (en-tête + corps). */
+function buildTemplateAoA(
+  rows: Record<string, unknown>[],
+  colMap: ColumnMap,
+  fallbackCategory: string,
+): (string | number)[][] {
+  const cell = (row: Record<string, unknown>, field: KeywordField) => {
+    const key = colMap[field];
+    return key !== undefined ? row[key] : '';
+  };
+
+  const body = rows
+    .map(row => {
+      const keyword = String(cell(row, 'keyword') ?? '').trim();
+      if (!keyword) return null;
+      const category = String(cell(row, 'categorie') ?? '').trim() || fallbackCategory;
+      const volume = Math.max(0, Math.round(parseLocalizedNumber(cell(row, 'volume'), 0)));
+      const difficulty = Math.min(100, Math.max(0, Math.round(parseLocalizedNumber(cell(row, 'difficulte'), 30))));
+      const proximity = colMap.proximite ? parseProximity(cell(row, 'proximite')) : 1;
+      const intention = colMap.intention ? parseIntention(cell(row, 'intention')) : 1;
+      const topic = String(cell(row, 'sujet') ?? '').trim();
+      return [category, keyword, volume, difficulty, proximity, intention, topic] as (string | number)[];
+    })
+    .filter((r): r is (string | number)[] => r !== null);
+
+  return [TEMPLATE_HEADERS, ...body];
+}
 
 /* ─── SHARED STYLES ──────────────────────────────────────────── */
 const card: CSSProperties = {
@@ -618,6 +759,8 @@ export default function SimulateurSEO() {
   const [workspaceId, setWorkspaceId] = useState<string>('');
   const resultsRef  = useRef<HTMLDivElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
+  const convertInputRef = useRef<HTMLInputElement>(null);
+  const [importError, setImportError] = useState('');
 
   /* Unsaved-changes tracking - skipDirtyRef ignores state changes caused by
      the initial load (URL/report fetch) so only real user edits count. */
@@ -1306,115 +1449,59 @@ export default function SimulateurSEO() {
 
   const removeKw = (id: string) => setState(s => ({ ...s, keywords: s.keywords.filter(k => k.id !== id) }));
 
-  /* ── EXCEL IMPORT ─────────────────────────────────────────── */
-  const INTENT_MAP: Record<string, Intention> = {
-    transactionnel: 1, transactional: 1, achat: 1, '1': 1,
-    'pré-achat': 2, 'pre-achat': 2, preachat: 2, consideration: 2, navigationnelle: 2, navigationnel: 2, '2': 2,
-    intermédiaire: 3, intermediaire: 3, commerciale: 3, commercial: 3, '3': 3,
-    informationnel: 4, informational: 4, information: 4, info: 4, '4': 4,
-  };
-  const PROXIMITY_MAP: Record<string, Proximity> = {
-    exact: 1, 'sujet exact': 1, 'mot cle exact': 1, '1': 1,
-    proche: 2, 'tres proche': 2, 'très proche': 2, near: 2, '2': 2,
-    thematique: 3, thématique: 3, thematic: 3, large: 3, '3': 3,
-  };
-  const normalize = (s: string) =>
-    s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
-
-  const parseLocalizedNumber = (value: unknown, fallback = 0): number => {
-    if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
-    let raw = String(value ?? '').trim();
-    if (!raw) return fallback;
-
-    raw = raw.toLowerCase();
-    const rangeParts = raw.split(/\s*[-–—]\s*/).filter(Boolean);
-    if (rangeParts.length === 2) {
-      const [minRange, maxRange] = rangeParts.map(part => parseLocalizedNumber(part, fallback));
-      return (minRange + maxRange) / 2;
-    }
-
-    raw = raw
-      .replace(/[  \s]/g, '')
-      .replace(/€/g, '')
-      .replace(/%/g, '');
-
-    let multiplier = 1;
-    if (raw.endsWith('k')) { multiplier = 1_000; raw = raw.slice(0, -1); }
-    if (raw.endsWith('m')) { multiplier = 1_000_000; raw = raw.slice(0, -1); }
-
-    const comma = raw.lastIndexOf(',');
-    const dot = raw.lastIndexOf('.');
-    if (comma !== -1 && dot !== -1) {
-      raw = comma > dot ? raw.replace(/\./g, '').replace(',', '.') : raw.replace(/,/g, '');
-    } else if (comma !== -1) {
-      const parts = raw.split(',');
-      raw = parts.length > 1 && parts.at(-1)?.length === 3 ? raw.replace(/,/g, '') : raw.replace(',', '.');
-    } else if (dot !== -1) {
-      const parts = raw.split('.');
-      raw = parts.length > 1 && parts.slice(1).every(part => part.length === 3) ? raw.replace(/\./g, '') : raw;
-    }
-
-    const parsed = Number(raw.replace(/[^0-9.-]/g, ''));
-    return Number.isFinite(parsed) ? parsed * multiplier : fallback;
+  /* ── IMPORT / CONVERSION EXCEL ─────────────────────────────────
+     Lit la 1re feuille du fichier et renvoie ses lignes + le mapping de
+     colonnes identifié (fonction 1). Facteur commun à l'import direct et
+     au convertisseur. */
+  const readSheet = (
+    file: File,
+    onReady: (rows: Record<string, unknown>[], colMap: ColumnMap) => void,
+  ) => {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const wb  = XLSX.read(ev.target?.result, { type: 'array' });
+      const ws  = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '' });
+      if (!rows.length) { setImportError('Fichier vide ou illisible.'); return; }
+      // Fonction 1 : identification des colonnes à partir de la ligne d'en-tête.
+      onReady(rows, identifyColumns(Object.keys(rows[0] as object)));
+    };
+    reader.readAsArrayBuffer(file);
   };
 
-  const parseProximity = (value: unknown): Proximity => {
-    const normalized = normalize(String(value ?? ''));
-    const numeric = Math.round(parseLocalizedNumber(value, 1));
-    return PROXIMITY_MAP[normalized] ?? (Math.min(3, Math.max(1, numeric)) as Proximity);
-  };
-
+  // Import direct : ajoute les mots clés du fichier dans la simulation, en
+  // créant les catégories nommées dans le fichier (ou une catégorie par défaut).
   const importExcel = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     e.target.value = '';
 
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const wb  = XLSX.read(ev.target?.result, { type: 'array' });
-      const ws  = wb.Sheets[wb.SheetNames[0]];
-      const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '' });
-      if (!raw.length) return;
-
-      // Map header keys → normalized, so imported files can use accents,
-      // English labels, exports from SEO tools, or custom casing/spaces.
-      const headerMap: Record<string, string> = {};
-      Object.keys(raw[0]).forEach(h => { headerMap[normalize(h)] = h; });
-
-      const col = (row: Record<string, unknown>, ...aliases: string[]) => {
-        for (const a of aliases) {
-          const key = headerMap[normalize(a)];
-          if (key !== undefined) return row[key];
-        }
-        return '';
-      };
-
-      // Build category map: name → id (create new ids for new category names)
+    readSheet(file, (raw, colMap) => {
       const fallbackCatName = file.name.replace(/\.[^.]+$/, '');
       const catNameToId: Record<string, string> = {};
 
       const newKws: Keyword[] = raw.map(row => {
-        const intentRaw = normalize(String(col(row, 'intention', 'intent', 'search intent') ?? ''));
-        const catLabel = String(col(row, 'categorie', 'catégorie', 'category', 'cat', 'groupe', 'cluster') || fallbackCatName).trim();
+        const keyword = String((colMap.keyword ? row[colMap.keyword] : '') ?? '').trim();
+        const catLabel = String((colMap.categorie ? row[colMap.categorie] : '') || fallbackCatName).trim();
         if (!catNameToId[catLabel]) catNameToId[catLabel] = uid();
         return {
           id:         uid(),
-          keyword:    String(col(row, 'mot cle', 'mot-clé', 'mot-cle', 'keyword', 'kw', 'requete', 'requête', 'query', 'terme') ?? '').trim(),
-          volume:     Math.max(0, Math.round(parseLocalizedNumber(col(row, 'volume', 'vol', 'volume mensuel', 'volume de recherche', 'search volume', 'monthly volume', 'avg. monthly searches', 'recherches mensuelles'), 0))),
-          difficulty: Math.min(100, Math.max(0, Math.round(parseLocalizedNumber(col(row, 'difficulte', 'difficulté', 'difficulty', 'diff', 'kd', 'kd %', 'seo difficulty', 'keyword difficulty'), 30)))),
-          proximity:  parseProximity(col(row, 'proximite', 'proximité', 'proximity', 'prox')),
-          intention:  (INTENT_MAP[intentRaw] ?? 1) as Intention,
-          topic:      String(col(row, 'sujet', 'topic', 'theme', 'thème', 'cluster', 'page') ?? '').trim(),
+          keyword,
+          volume:     Math.max(0, Math.round(parseLocalizedNumber(colMap.volume ? row[colMap.volume] : '', 0))),
+          difficulty: Math.min(100, Math.max(0, Math.round(parseLocalizedNumber(colMap.difficulte ? row[colMap.difficulte] : '', 30)))),
+          proximity:  colMap.proximite ? parseProximity(row[colMap.proximite]) : (1 as Proximity),
+          intention:  colMap.intention ? parseIntention(row[colMap.intention]) : (1 as Intention),
+          topic:      String((colMap.sujet ? row[colMap.sujet] : '') ?? '').trim(),
           categoryId: catNameToId[catLabel],
           zone:       'chalandise' as Zone,
         };
       }).filter(k => k.keyword);
 
-      if (!newKws.length) return;
-      const newCats: Category[] = Object.entries(catNameToId).map(([name, id]) => {
-        const nbInCat = newKws.filter(k => k.categoryId === id).length;
-        return { id, name, budget: DEFAULT_CATEGORY_BUDGET };
-      });
+      if (!newKws.length) { setImportError("Aucun mot clé trouvé : vérifiez que la 1re ligne contient un en-tête « Mot clé »."); return; }
+      const usedCatIds = new Set(newKws.map(k => k.categoryId));
+      const newCats: Category[] = Object.entries(catNameToId)
+        .filter(([, id]) => usedCatIds.has(id))
+        .map(([name, id]) => ({ id, name, budget: DEFAULT_CATEGORY_BUDGET }));
       const newCatIds = new Set(newCats.map(c => c.id));
       setState(s => ({
         ...s,
@@ -1422,8 +1509,35 @@ export default function SimulateurSEO() {
         keywords:   [...s.keywords, ...newKws],
       }));
       setOpenCats(prev => { const n = new Set(prev); newCatIds.forEach(id => n.add(id)); return n; });
-    };
-    reader.readAsArrayBuffer(file);
+      setImportError('');
+    });
+  };
+
+  // Convertisseur : prend un export SEO quelconque et retélécharge un fichier
+  // au format template attendu, sans l'importer dans la simulation.
+  const convertImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+
+    readSheet(file, (rows, colMap) => {
+      if (!colMap.keyword) {
+        setImportError("Impossible d'identifier la colonne « mot clé » : vérifiez la 1re ligne (en-têtes) du fichier.");
+        return;
+      }
+      // Fonction 2 : mise en forme des données au format template attendu.
+      const aoa = buildTemplateAoA(rows, colMap, file.name.replace(/\.[^.]+$/, ''));
+      if (aoa.length <= 1) {
+        setImportError('Aucun mot clé exploitable trouvé dans ce fichier.');
+        return;
+      }
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = [{ wch: 18 }, { wch: 28 }, { wch: 10 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 20 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Mots clés');
+      XLSX.writeFile(wb, 'mots-cles-converti.xlsx');
+      setImportError('');
+    });
   };
 
   const downloadTemplate = () => {
@@ -1467,6 +1581,49 @@ export default function SimulateurSEO() {
 
   const updateKw = (id: string, field: keyof Keyword, value: unknown) =>
     setState(s => ({ ...s, keywords: s.keywords.map(k => k.id === id ? { ...k, [field]: value } : k) }));
+
+  /* ── SÉLECTION + GLISSER-DÉPOSER DE MOTS CLÉS ─────────────────
+     Sélection multiple (cases à cocher) puis glisser-déposer d'un ou
+     plusieurs mots clés d'une catégorie vers une autre. */
+  const [selectedKwIds, setSelectedKwIds] = useState<Set<string>>(new Set());
+  const [dragOverCatId, setDragOverCatId] = useState<string | null>(null);
+  const [isDraggingKw, setIsDraggingKw] = useState(false);
+
+  const toggleKwSelection = (id: string) => setSelectedKwIds(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  // Déplace un ensemble de mots clés vers une catégorie cible.
+  const moveKeywordsToCategory = (ids: Set<string>, targetCatId: string) => {
+    if (!ids.size) return;
+    setState(s => ({
+      ...s,
+      keywords: s.keywords.map(k => ids.has(k.id) ? { ...k, categoryId: targetCatId } : k),
+    }));
+    setOpenCats(prev => { const n = new Set(prev); n.add(targetCatId); return n; });
+  };
+
+  // Début du glissement d'une ligne : si le mot clé glissé n'est pas déjà
+  // sélectionné, on le prend seul ; sinon on déplace toute la sélection.
+  const handleKwDragStart = (kwId: string, e: React.DragEvent) => {
+    const ids = selectedKwIds.has(kwId) ? new Set(selectedKwIds) : new Set([kwId]);
+    if (!selectedKwIds.has(kwId)) setSelectedKwIds(ids);
+    setIsDraggingKw(true);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', Array.from(ids).join(','));
+  };
+
+  const handleCatDrop = (targetCatId: string, e: React.DragEvent) => {
+    e.preventDefault();
+    const raw = e.dataTransfer.getData('text/plain');
+    const ids = new Set((raw ? raw.split(',') : Array.from(selectedKwIds)).filter(Boolean));
+    moveKeywordsToCategory(ids, targetCatId);
+    setSelectedKwIds(new Set());
+    setDragOverCatId(null);
+    setIsDraggingKw(false);
+  };
 
   const [saveError, setSaveError] = useState('');
   const [funnelPeriod, setFunnelPeriod] = useState<'month' | 'year'>('month');
@@ -1920,11 +2077,14 @@ export default function SimulateurSEO() {
 
           {/* MOTS CLÉS par catégorie */}
           <div style={{ ...cardLight, padding: '14px 12px' }}>
-            <div style={{ ...secTitleLight, marginBottom: 12 }}>
+            <div style={{ ...secTitleLight, marginBottom: 12, flexWrap: 'wrap', rowGap: 6 }}>
               <span style={{ color: ORANGE, fontSize: 10 }}>◆</span> Mots clés
-              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 <button onClick={downloadTemplate} style={{ backgroundColor: 'transparent', border: `1px solid ${L_BORD}`, borderRadius: 4, padding: '3px 10px', color: L_MED, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
                   ↓ Modèle
+                </button>
+                <button onClick={() => convertInputRef.current?.click()} title="Convertir un export SEO (Semrush, Ahrefs, Search Console…) au format attendu et le télécharger" style={{ backgroundColor: 'transparent', border: `1px solid ${L_BORD}`, borderRadius: 4, padding: '3px 10px', color: L_MED, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+                  ⇄ Convertir
                 </button>
                 <button onClick={() => xlsxInputRef.current?.click()} style={{ backgroundColor: 'transparent', border: `1px solid ${ORANGE}`, borderRadius: 4, padding: '3px 10px', color: ORANGE, fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
                   ↑ Importer Excel
@@ -1934,17 +2094,46 @@ export default function SimulateurSEO() {
                 </button>
               </div>
               <input ref={xlsxInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={importExcel} style={{ display: 'none' }} />
+              <input ref={convertInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={convertImport} style={{ display: 'none' }} />
             </div>
+            {importError && (
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: '#fff6f3', border: `1px solid ${ORANGE}`, borderRadius: 6, padding: '7px 10px', marginBottom: 12, color: '#b3400f', fontSize: 11 }}>
+                <span style={{ flex: 1 }}>{importError}</span>
+                <button onClick={() => setImportError('')} aria-label="Fermer" style={{ background: 'none', border: 'none', color: '#b3400f', cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+            )}
+
+            {selectedKwIds.size > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, background: '#fdece4', border: `1px solid ${ORANGE}`, borderRadius: 6, padding: '7px 10px', marginBottom: 12, fontSize: 11, color: L_DARK }}>
+                <span style={{ fontWeight: 700 }}>{selectedKwIds.size} mot{selectedKwIds.size > 1 ? 's' : ''}-clé{selectedKwIds.size > 1 ? 's' : ''} sélectionné{selectedKwIds.size > 1 ? 's' : ''}</span>
+                <span style={{ color: L_MED }}>· glissez-les sur une catégorie, ou déplacez vers :</span>
+                <select
+                  value=""
+                  onChange={e => { if (e.target.value) { moveKeywordsToCategory(new Set(selectedKwIds), e.target.value); setSelectedKwIds(new Set()); } }}
+                  style={{ backgroundColor: L_INPUT, border: `1px solid ${L_BORD}`, borderRadius: 4, color: L_DARK, fontSize: 11, padding: '3px 6px', outline: 'none', cursor: 'pointer' }}
+                >
+                  <option value="">Choisir une catégorie…</option>
+                  {categories.map(c => <option key={c.id} value={c.id}>{c.name || 'Sans nom'}</option>)}
+                </select>
+                <button
+                  onClick={() => setSelectedKwIds(new Set())}
+                  style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${L_BORD}`, borderRadius: 4, color: L_MED, fontSize: 11, fontWeight: 600, padding: '3px 8px', cursor: 'pointer' }}
+                >Désélectionner</button>
+              </div>
+            )}
 
             {categories.map((cat, catIdx) => {
               const catKws = keywords.filter(k => k.categoryId === cat.id);
               const isOpen = openCats.has(cat.id);
               return (
-                <div key={cat.id} style={{ marginBottom: 8, border: `1px solid ${L_BORD}`, borderRadius: 8, overflow: 'hidden' }}>
-                  {/* Category header */}
+                <div key={cat.id} style={{ marginBottom: 8, border: dragOverCatId === cat.id ? `2px dashed ${ORANGE}` : `1px solid ${L_BORD}`, borderRadius: 8, overflow: 'hidden' }}>
+                  {/* Category header (zone de dépôt pour le glisser-déposer de mots clés) */}
                   <div
                     onClick={() => toggleCat(cat.id)}
-                    style={{ display: 'flex', flexDirection: 'column', gap: 7, padding: '8px 10px', backgroundColor: isOpen ? '#f0ece4' : '#f7f5f0', cursor: 'pointer', userSelect: 'none' }}
+                    onDragOver={e => { if (isDraggingKw) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (dragOverCatId !== cat.id) setDragOverCatId(cat.id); } }}
+                    onDragLeave={e => { if (e.currentTarget === e.target) setDragOverCatId(prev => prev === cat.id ? null : prev); }}
+                    onDrop={e => handleCatDrop(cat.id, e)}
+                    style={{ display: 'flex', flexDirection: 'column', gap: 7, padding: '8px 10px', backgroundColor: dragOverCatId === cat.id ? '#fbe9e1' : isOpen ? '#f0ece4' : '#f7f5f0', cursor: 'pointer', userSelect: 'none' }}
                   >
                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0, width: '100%' }}>
                       <span style={{ fontSize: 10, color: L_MED, width: 12, flexShrink: 0, paddingTop: 3 }}>{isOpen ? '▼' : '▶'}</span>
@@ -2020,6 +2209,7 @@ export default function SimulateurSEO() {
                         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
                           <thead>
                             <tr style={{ color: L_MED }}>
+                              <th style={{ width: 34, padding: '3px 2px 5px 0' }} />
                               <th style={{ padding: '3px 4px 5px 0', textAlign: 'left' }}>Mot clé</th>
                               <th style={{ padding: '3px 2px 5px', textAlign: 'center', minWidth: 52 }}>Volume mensuel</th>
                               <th style={{ padding: '3px 2px 5px', textAlign: 'center', minWidth: 36 }}>Diff.</th>
@@ -2031,8 +2221,26 @@ export default function SimulateurSEO() {
                             </tr>
                           </thead>
                           <tbody>
-                            {catKws.map(kw => (
-                              <tr key={kw.id} style={{ borderTop: `1px solid ${L_BORD}` }}>
+                            {catKws.map(kw => {
+                              const isSelected = selectedKwIds.has(kw.id);
+                              return (
+                              <tr key={kw.id} style={{ borderTop: `1px solid ${L_BORD}`, backgroundColor: isSelected ? '#fdece4' : 'transparent' }}>
+                                <td style={{ padding: '4px 2px 4px 0', whiteSpace: 'nowrap' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleKwSelection(kw.id)}
+                                    aria-label={`Sélectionner ${kw.keyword || 'ce mot clé'}`}
+                                    style={{ cursor: 'pointer', verticalAlign: 'middle' }}
+                                  />
+                                  <span
+                                    draggable
+                                    onDragStart={e => handleKwDragStart(kw.id, e)}
+                                    onDragEnd={() => { setIsDraggingKw(false); setDragOverCatId(null); }}
+                                    title="Glisser vers une autre catégorie"
+                                    style={{ cursor: 'grab', color: L_MED, fontSize: 13, marginLeft: 3, verticalAlign: 'middle', userSelect: 'none' }}
+                                  >⠿</span>
+                                </td>
                                 <td style={{ padding: '4px 4px 4px 0' }}>
                                   <input value={kw.keyword} onChange={e => updateKw(kw.id, 'keyword', e.target.value)} placeholder="mot clé…"
                                     style={{ backgroundColor: 'transparent', border: 'none', color: L_DARK, fontSize: 11, outline: 'none', width: '100%', minWidth: 100 }} />
@@ -2079,7 +2287,8 @@ export default function SimulateurSEO() {
                                   <button onClick={() => removeKw(kw.id)} style={{ background: 'none', border: 'none', color: '#c05050', cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: 0 }}>×</button>
                                 </td>
                               </tr>
-                            ))}
+                              );
+                            })}
                           </tbody>
                         </table>
                       )}
